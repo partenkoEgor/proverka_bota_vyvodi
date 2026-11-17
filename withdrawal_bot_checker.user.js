@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         Проверка бота автозакрытия выводов
 // @namespace    proverka-bota-vyvodi
-// @version      0.1.0
+// @version      0.1.1
 // @description  Проверяет работу «Бот_ПК закрытия тикетов выводов» по правилам: для каждого тикета грузит историю и транзакцию из отчёта Withdrawal requests, сверяет 11 условий, находит ошибки бота и тикеты, которые бот должен был закрыть, но не закрыл. Ничего не меняет в тикетах — только читает и выгружает Excel.
 // @match        *://th-managment.com/*paymentsupport*
 // @match        *://my-managment.com/*paymentsupport*
 // @match        *://managment.io/*paymentsupport*
 // @match        *://webmanegment.com/*paymentsupport*
+// @match        *://th-managment.com/*ExtendedPaymentRequestList*
+// @match        *://my-managment.com/*ExtendedPaymentRequestList*
+// @match        *://managment.io/*ExtendedPaymentRequestList*
+// @match        *://webmanegment.com/*ExtendedPaymentRequestList*
 // @require      https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js
 // @grant        GM_addStyle
 // @run-at       document-idle
@@ -434,7 +438,7 @@ window.__pbv_loaded = true;
 // ════════════════════════════════════════════════════
 // КОНФИГ ЗАПРОСОВ
 // ════════════════════════════════════════════════════
-var VERSION = '0.1.0';
+var VERSION = '0.1.1';
 var HISTORY_URL = '/admin/backoffice/paymentsupporthistory';
 var REPORT_URL = '/en/admin/report/requestwithdrawal';
 // Поля формы отчёта Withdrawal requests (как шлёт сама страница); заполнен только id.

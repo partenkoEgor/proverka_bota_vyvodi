@@ -11,11 +11,11 @@ Tampermonkey-скрипт: проверяет, правильно ли **«Бо�
 > Пока изменения не влиты в `main`, ставить с ветки:
 > https://raw.githubusercontent.com/partenkoEgor/proverka_bota_vyvodi/claude/confident-cori-8cded6/withdrawal_bot_checker.user.js
 
-Работает на страницах Payment Support (`th-managment.com`, `my-managment.com`, `managment.io`, `webmanegment.com`). Кнопка **Проверка бота** — слева внизу (над Double Mistakes и In Progress), или **Alt+B**.
+Работает на листах **Payment Support** (`paymentsupport`) и **List of payment queries (Extended)** (`ExtendedPaymentRequestList`) на доменах `th-managment.com`, `my-managment.com`, `managment.io`, `webmanegment.com`. Кнопка **Проверка бота** — слева внизу (над Double Mistakes и In Progress), или **Alt+B**.
 
 ## Как запускать
 
-- **По фильтру.** Выставить фильтр тикетов (период; удобно сразу выбрать темы «I didn't receive my withdrawal» и «Error while withdrawing funds»), нажать **APPLY**, затем **▶ Проверить по APPLY**. Скрипт пройдёт все страницы выдачи.
+- **По фильтру.** Выставить фильтр тикетов (период; удобно сразу выбрать темы «I didn't receive my withdrawal» и «Error while withdrawing funds»), нажать **APPLY**, затем **▶ Проверить по APPLY**. Скрипт пройдёт все страницы выдачи. Понимает оба вида списка: Payment Support (`page`/`perPage`, конец по `hasMore`) и расширенный (`numberPage`/`countOfItemPage`, конец по `total`).
 - **По списку.** Вставить Ticket ID (разделитель любой) и нажать **▶ Проверить список**.
 - **Потоков (1–5)** — сколько тикетов грузится параллельно. При 429/5xx скрипт сам повторяет запрос с паузой (до 5 раз).
 - **⏹ Стоп** — останавливает и выгружает то, что уже проверено.
