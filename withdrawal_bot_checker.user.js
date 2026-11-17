@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Проверка бота автозакрытия выводов
 // @namespace    proverka-bota-vyvodi
-// @version      0.2.0
+// @version      0.3.0
 // @description  Проверяет работу «Бот_ПК закрытия тикетов выводов» по правилам: для каждого тикета грузит историю и транзакцию из отчёта Withdrawal requests, сверяет 11 условий, находит ошибки бота и тикеты, которые бот должен был закрыть, но не закрыл. Ничего не меняет в тикетах — только читает и выгружает Excel.
 // @match        *://th-managment.com/*paymentsupport*
 // @match        *://my-managment.com/*paymentsupport*
@@ -497,7 +497,7 @@ window.__pbv_loaded = true;
 // ════════════════════════════════════════════════════
 // КОНФИГ ЗАПРОСОВ
 // ════════════════════════════════════════════════════
-var VERSION = '0.2.0';
+var VERSION = '0.3.0';
 var HISTORY_URL = '/admin/backoffice/paymentsupporthistory';
 var REPORT_URL = '/en/admin/report/requestwithdrawal';
 // Поля формы отчёта Withdrawal requests (как шлёт сама страница); заполнен только id.
@@ -509,6 +509,8 @@ var MAX_RETRIES = 5;
 var POLL_INTERVAL = 800, POLL_MAX = 8;
 var LIST_RETRIES = 8, LIST_RETRY_BASE_MS = 3000;
 var DEFAULT_THREADS = 3;
+var TX_FILE_LIMIT = 5000;       // сколько номеров в одной части (лимит выгрузки из базы)
+var COLLECT_KEY = 'pbv_collected'; // собранный список — в localStorage, чтобы пережил перезагрузку
 
 var CATS = {
   bot_error:      {title: 'Ошибки бота',      color: '#ff6e5a'},
@@ -527,7 +529,10 @@ var state = {running: false, source: '', total: 0, done: 0, currentPage: 1, expe
              stopReason: '', pagesDone: 0, finishing: false};
 var _listUrl = null, _listPayload = null, _keepaliveTimer = null;
 var txCache = {};
-var dbIndex = null;   // транзакции из выгрузки базы: {map, count, missing, fileName}
+var dbIndex = null;   // транзакции из выгрузок базы: {map, count, files: [{name, count}], missing}
+// Шаг 1: {ticketIds, txIds, byTicket: {ticket: tx}, skipped, noTx, loadErrors, source, savedAt}
+// и истории тикетов (только в памяти — для шага 2 без повторной загрузки)
+var collected = null, histCache = {};
 
 // ════════════════════════════════════════════════════
 // УТИЛИТЫ
@@ -628,13 +633,21 @@ GM_addStyle(`
 #pbv-hdr .v{font-size:10px;color:#6a8ab0;border:1px solid rgba(90,170,255,.3);border-radius:4px;padding:1px 6px;}
 #pbv-close{margin-left:auto;background:none;border:none;color:rgba(255,255,255,.4);font-size:18px;cursor:pointer;}
 #pbv-body{display:flex;gap:16px;padding:16px 18px;overflow:hidden;flex:1;min-height:0;}
-#pbv-side{width:290px;flex-shrink:0;display:flex;flex-direction:column;gap:10px;}
+#pbv-side{width:300px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;overflow-y:auto;padding-right:4px;}
+#pbv-side > *{flex-shrink:0;}
+.pbv-row{display:flex;gap:6px;}
+.pbv-row .pbv-btn{flex:1;padding:8px 4px;}
+.pbv-step{border:1px solid rgba(90,170,255,.25);border-radius:10px;padding:9px;display:flex;flex-direction:column;gap:7px;}
+.pbv-step .pbv-sec{color:#8fb6e6;}
+.pbv-mini{padding:5px 8px;border-radius:6px;border:1px solid rgba(90,170,255,.4);background:rgba(90,170,255,.1);color:#cfe4ff;font:700 11px Arial,sans-serif;cursor:pointer;margin:3px 4px 0 0;}
+.pbv-mini:disabled{opacity:.35;cursor:not-allowed;}
+.pbv-note{font-size:10px;color:rgba(200,220,255,.45);line-height:1.45;}
 #pbv-main{flex:1;display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0;}
 .pbv-sec{font-size:9px;font-weight:700;color:#6a8ab0;text-transform:uppercase;letter-spacing:.7px;}
 .pbv-field{border-radius:8px;padding:8px 10px;font-size:12px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);}
 .pbv-field.ok{border-color:rgba(63,250,130,.4);color:#5fd876;background:rgba(63,250,130,.07);}
 .pbv-field.warn{border-color:rgba(240,165,0,.35);color:#f0a500;background:rgba(240,165,0,.06);}
-#pbv-ids{width:100%;box-sizing:border-box;height:100px;resize:vertical;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e0ecff;font:12px monospace;outline:none;}
+#pbv-ids{width:100%;box-sizing:border-box;height:70px;resize:vertical;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e0ecff;font:12px monospace;outline:none;}
 .pbv-btn{width:100%;padding:9px;border-radius:8px;border:1px solid rgba(90,170,255,.6);background:rgba(90,170,255,.16);color:#cfe4ff;font:800 12px Arial,sans-serif;cursor:pointer;}
 .pbv-btn:disabled{opacity:.35;cursor:not-allowed;}
 #pbv-db-state{font-size:11px;}
@@ -670,18 +683,25 @@ wrap.innerHTML =
     '<div id="pbv-hdr"><span class="t">🤖 Проверка бота автозакрытия выводов</span><span class="v">' + VERSION + '</span><button id="pbv-close">✕</button></div>' +
     '<div id="pbv-body">' +
       '<div id="pbv-side">' +
-        '<div class="pbv-sec">Вариант 1 — тикеты из фильтра</div>' +
+        '<div class="pbv-sec">Тикеты</div>' +
         '<div class="pbv-field warn" id="pbv-apply">⚠ Выставь фильтр и нажми APPLY — перехвачу список</div>' +
-        '<button class="pbv-btn" id="pbv-run-apply" disabled>▶ Проверить по APPLY</button>' +
-        '<div class="pbv-sec" style="margin-top:6px">Вариант 2 — свои Ticket ID</div>' +
-        '<textarea id="pbv-ids" placeholder="26081917&#10;26104522&#10;… (любой разделитель)"></textarea>' +
-        '<button class="pbv-btn" id="pbv-run-ids">▶ Проверить список</button>' +
-        '<button class="pbv-btn" id="pbv-stop">⏹ Стоп — выгрузить</button>' +
-        '<div class="pbv-sec" style="margin-top:6px">Транзакции из базы (xlsx / csv)</div>' +
-        '<label class="pbv-btn" id="pbv-db-btn" style="text-align:center;box-sizing:border-box">📄 Загрузить выгрузку<input id="pbv-db-file" type="file" accept=".xlsx,.xls,.csv" style="display:none"></label>' +
-        '<div class="pbv-field" id="pbv-db-state">Не загружена — транзакции ищутся в Withdrawal requests</div>' +
+        '<textarea id="pbv-ids" placeholder="или свои Ticket ID: 26081917 26104522 … (любой разделитель)"></textarea>' +
+        '<div class="pbv-step">' +
+          '<div class="pbv-sec">Шаг 1 — собрать номера транзакций</div>' +
+          '<div class="pbv-row"><button class="pbv-btn" id="pbv-col-apply" disabled>① По APPLY</button><button class="pbv-btn" id="pbv-col-ids">① По списку</button></div>' +
+          '<div class="pbv-field" id="pbv-col-state">Грузит только истории тикетов и собирает Transaction ID в один столбец, частями по ' + TX_FILE_LIMIT + '</div>' +
+        '</div>' +
+        '<div class="pbv-step">' +
+          '<div class="pbv-sec">Шаг 2 — выгрузки из базы и проверка</div>' +
+          '<label class="pbv-btn" style="text-align:center;box-sizing:border-box">📄 Загрузить выгрузку (можно несколько)<input id="pbv-db-file" type="file" accept=".xlsx,.xls,.csv" multiple style="display:none"></label>' +
+          '<div class="pbv-field" id="pbv-db-state">Не загружена — транзакции ищутся в Withdrawal requests</div>' +
+          '<button class="pbv-btn" id="pbv-check-collected" disabled>② Проверить собранные</button>' +
+        '</div>' +
+        '<div class="pbv-sec" style="margin-top:4px">Или сразу проверить, без шага 1</div>' +
+        '<div class="pbv-row"><button class="pbv-btn" id="pbv-run-apply" disabled>▶ По APPLY</button><button class="pbv-btn" id="pbv-run-ids">▶ По списку</button></div>' +
+        '<button class="pbv-btn" id="pbv-stop">⏹ Стоп</button>' +
         '<label style="font-size:11px;color:rgba(200,220,255,.6);display:flex;align-items:center;gap:8px">Потоков (1–5): <input id="pbv-threads" type="number" min="1" max="5" value="' + DEFAULT_THREADS + '" style="width:48px;padding:4px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#e0ecff"></label>' +
-        '<div style="font-size:10px;color:rgba(200,220,255,.45);line-height:1.45">Только чтение: история тикета + транзакция из Withdrawal requests. Бот: <b>' + esc(RULES.botLogin) + '</b>. Удобно сузить фильтр темами «I didn\'t receive my withdrawal» и «Error while withdrawing funds».</div>' +
+        '<div class="pbv-note">Только чтение. Бот: <b>' + esc(RULES.botLogin) + '</b>. Удобно сузить фильтр темами «I didn\'t receive my withdrawal» и «Error while withdrawing funds».</div>' +
       '</div>' +
       '<div id="pbv-main">' +
         '<div class="pbv-metrics">' +
@@ -728,6 +748,13 @@ function updateApplyState(){
     el.textContent = '✅ Фильтр пойман' + (_listPayload && _listPayload.dateFrom ? ' (с ' + _listPayload.dateFrom + ')' : '');
   }
   $('pbv-run-apply').disabled = !_listUrl || state.running;
+  $('pbv-col-apply').disabled = !_listUrl || state.running;
+}
+function updateCollectedButton(){
+  var b = $('pbv-check-collected'); if(!b) return;
+  var n = collected ? collected.ticketIds.length + (collected.loadErrors || []).length : 0;
+  b.disabled = !n || state.running;
+  b.textContent = collected ? '② Проверить собранные — тикетов: ' + n : '② Проверить собранные';
 }
 function setProgress(){
   var total = Math.max(state.total, state.expectedTotal || 0);
@@ -758,9 +785,10 @@ function addFoundItem(r){
 function setRunning(on){
   state.running = on;
   fab.classList.toggle('running', on);
-  $('pbv-run-ids').disabled = on;
+  ['pbv-run-ids', 'pbv-col-ids', 'pbv-db-file'].forEach(function(id){ $(id).disabled = on; });
   $('pbv-stop').style.display = on ? 'block' : 'none';
   updateApplyState();
+  updateCollectedButton();
 }
 
 // ════════════════════════════════════════════════════
@@ -858,8 +886,9 @@ function fetchTransaction(txId){
 // ════════════════════════════════════════════════════
 // ОБРАБОТКА ТИКЕТА
 // ════════════════════════════════════════════════════
-function processTicket(ticketId){
-  return fetchHistory(ticketId).then(function(hist){
+function processTicket(ticketId, useCache){
+  var histP = useCache && histCache[ticketId] ? Promise.resolve(histCache[ticketId]) : fetchHistory(ticketId);
+  return histP.then(function(hist){
     var txId = Checker.transactionNeeded(hist);
     var txP = !txId ? Promise.resolve({row: null, error: 'в тикете нет Transaction ID'})
       : dbIndex && dbIndex.map[txId] ? Promise.resolve({row: dbIndex.map[txId]})
@@ -898,10 +927,10 @@ function runPool(ids){
   function worker(){
     if(!state.running || idx >= ids.length) return Promise.resolve();
     var id = ids[idx++];
-    return processTicket(id).then(function(r){
-      record(r);
+    return state.task(id).then(function(){
       state.done++;
       setProgress();
+      if(state.mode === 'collect' && (state.done % 10 === 0)) renderCollected();
       setStatus((state.source === 'apply' ? 'Стр.' + state.currentPage + ' | ' : '') + state.done + '/' +
         Math.max(state.total, state.expectedTotal || 0) + ' → #' + id + fmtEta());
       return sleep(state._delay);
@@ -912,7 +941,10 @@ function runPool(ids){
   return Promise.all(ws);
 }
 
-function resetRun(source){
+// mode: 'check' — проверка, 'collect' — шаг 1 (только истории и номера транзакций)
+function resetRun(source, mode, task){
+  state.mode = mode || 'check';
+  state.task = task;
   state.source = source; state.total = 0; state.done = 0; state.currentPage = 1; state.expectedTotal = 0;
   state.processedIds = {}; state.results = []; state.counts = {}; state._delay = DELAY_MIN;
   state.stopReason = ''; state.pagesDone = 0; state.finishing = false; state.startTime = Date.now();
@@ -965,49 +997,219 @@ function collectPage(attempt){
   }).catch(onError);
 }
 
-$('pbv-db-file').addEventListener('change', function(e){
-  var file = e.target.files && e.target.files[0];
+// ════════════════════════════════════════════════════
+// ШАГ 1 — СБОР НОМЕРОВ ТРАНЗАКЦИЙ
+// ════════════════════════════════════════════════════
+function checkTask(id){ return processTicket(id, false).then(record); }
+function checkCollectedTask(id){ return processTicket(id, true).then(record); }
+function collectTask(id){
+  return fetchHistory(id).then(function(hist){
+    histCache[id] = hist;
+    var txId = Checker.transactionNeeded(hist);
+    collected.ticketIds.push(id);
+    if(txId){
+      collected.byTicket[id] = txId;
+      if(!collected._seen[txId]){ collected._seen[txId] = 1; collected.txIds.push(txId); }
+      state.counts.collected = (state.counts.collected || 0) + 1;
+    }else{
+      // тема/тип не наши и бот не отвечал — или в тикете нет Transaction ID
+      collected.skipped++;
+      state.counts.not_applicable = (state.counts.not_applicable || 0) + 1;
+    }
+  }).catch(function(e){
+    if(e && e.message === 'SESSION_EXPIRED') throw e;
+    collected.loadErrors.push({ticketId: id, error: e && e.message});
+    state.counts.load_error = (state.counts.load_error || 0) + 1;
+  });
+}
+function startCollect(source){
+  histCache = {};
+  collected = {ticketIds: [], txIds: [], byTicket: {}, _seen: {}, skipped: 0, loadErrors: [], source: '', savedAt: ''};
+  resetRun(source, 'collect', collectTask);
+  collected.source = source === 'apply'
+    ? 'фильтр' + (_listPayload && _listPayload.dateFrom ? ' с ' + _listPayload.dateFrom + ' по ' + (_listPayload.dateTo || '') : '')
+    : 'список Ticket ID';
+  renderCollected();
+}
+function chunks(arr, n){ var out = []; for(var i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
+function copyText(text, what){
+  function ok(){ showToast('📋 Скопировано: ' + what, 'ok'); }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); ok(); }catch(e){ showToast('Не удалось скопировать', 'err'); }
+    ta.remove();
+  }
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(ok, fallback);
+  else fallback();
+}
+// Кнопки «скопировать часть N» для списка номеров
+function partButtons(list, prefix){
+  return chunks(list, TX_FILE_LIMIT).map(function(part, k){
+    var from = k * TX_FILE_LIMIT + 1, to = from + part.length - 1;
+    return '<button class="pbv-mini" data-copy="' + prefix + ':' + k + '">📋 ' +
+      (list.length > TX_FILE_LIMIT ? 'Часть ' + (k + 1) + ' (' + from + '–' + to + ')' : 'Копировать ' + part.length) + '</button>';
+  }).join('');
+}
+function renderCollected(){
+  var el = $('pbv-col-state');
+  if(!collected){ updateCollectedButton(); return; }
+  var n = collected.txIds.length, parts = Math.ceil(n / TX_FILE_LIMIT);
+  var html = (state.running && state.mode === 'collect' ? '⏳ ' : '✅ ') + 'Тикетов: <b>' + collected.ticketIds.length + '</b>, транзакций: <b>' + n + '</b>' +
+    (parts > 1 ? ' (' + parts + ' части по ≤' + TX_FILE_LIMIT + ')' : '') +
+    (collected.skipped ? '<br><span style="opacity:.7">не нужны: ' + collected.skipped + ' (тема/тип не те или нет Transaction ID)</span>' : '') +
+    (collected.loadErrors.length ? '<br><span style="color:#c080ff">не загрузилось: ' + collected.loadErrors.length + '</span>' : '') +
+    (collected.savedAt ? '<br><span style="opacity:.6">собрано ' + esc(collected.savedAt) + ', ' + esc(collected.source) + '</span>' : '');
+  if(n && !(state.running && state.mode === 'collect')){
+    html += '<div>' + partButtons(collected.txIds, 'all') + '<button class="pbv-mini" id="pbv-col-xlsx">⬇ Excel</button></div>';
+  }
+  el.className = 'pbv-field' + (n ? ' ok' : '');
+  el.innerHTML = html;
+  var x = $('pbv-col-xlsx');
+  if(x) x.addEventListener('click', function(){ var fn = buildCollectedXLSX(); showToast('⬇ ' + fn, 'ok'); });
+  updateCollectedButton();
+  renderDbState();
+}
+function missingTx(){
+  if(!collected) return [];
+  return collected.txIds.filter(function(id){ return !(dbIndex && dbIndex.map[id]); });
+}
+// Клики по кнопкам «📋» (делегирование: кнопки перерисовываются)
+wrap.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('[data-copy]');
+  if(!b) return;
+  var a = b.getAttribute('data-copy').split(':');
+  var list = a[0] === 'missing' ? missingTx() : (collected ? collected.txIds : []);
+  var part = chunks(list, TX_FILE_LIMIT)[+a[1]] || [];
+  copyText(part.join('\n'), part.length + ' номеров' + (a[0] === 'missing' ? ' (недостающие)' : ''));
+});
+
+function saveCollected(){
+  try{
+    localStorage.setItem(COLLECT_KEY, JSON.stringify({ticketIds: collected.ticketIds, txIds: collected.txIds,
+      byTicket: collected.byTicket, skipped: collected.skipped, loadErrors: collected.loadErrors,
+      source: collected.source, savedAt: collected.savedAt}));
+  }catch(e){ console.warn('[PBV] не удалось сохранить список', e); }
+}
+(function restoreCollected(){
+  try{
+    var c = JSON.parse(localStorage.getItem(COLLECT_KEY) || 'null');
+    if(c && Array.isArray(c.ticketIds) && Array.isArray(c.txIds)){
+      c._seen = {}; c.txIds.forEach(function(id){ c._seen[id] = 1; });
+      collected = c;
+      setTimeout(renderCollected, 0);
+    }
+  }catch(e){}
+})();
+
+function finishCollect(reason){
+  collected.savedAt = new Date().toLocaleString('ru-RU');
+  saveCollected();
+  renderCollected();
+  var n = collected.txIds.length;
+  if(!n){ setStatus((reason ? reason + ' | ' : '') + 'нужных транзакций не нашлось'); return; }
+  var fn = buildCollectedXLSX();
+  setStatus((reason ? reason + ' | ' : '✅ ') + fn + ' | транзакций ' + n + (n > TX_FILE_LIMIT ? ', частей ' + Math.ceil(n / TX_FILE_LIMIT) : '') +
+    '. Выгрузи их из базы и загрузи в шаге 2');
+  showToast('✅ Собрано ' + n + ' транзакций — ' + fn, 'ok');
+}
+
+// ════════════════════════════════════════════════════
+// ШАГ 2 — ВЫГРУЗКИ ИЗ БАЗЫ
+// ════════════════════════════════════════════════════
+function renderDbState(){
   var el = $('pbv-db-state');
-  if(!file) return;
-  el.className = 'pbv-field'; el.textContent = 'Читаю ' + file.name + '…';
-  file.arrayBuffer().then(function(buf){
+  if(!dbIndex){
+    el.className = 'pbv-field';
+    el.textContent = 'Не загружена — транзакции ищутся в Withdrawal requests';
+    return;
+  }
+  var need = ['статус', 'сумма', 'валюта', 'дата совершения платежа'].filter(function(c){ return dbIndex.missing.indexOf(c) !== -1; });
+  var miss = missingTx();
+  var html = (need.length || miss.length ? '⚠ ' : '✅ ') + 'Файлов: ' + dbIndex.files.length + ', транзакций: <b>' + dbIndex.count + '</b>' +
+    '<br><span style="opacity:.7">' + dbIndex.files.map(function(f){ return esc(f.name) + ' (' + f.count + ')'; }).join(', ') + '</span>';
+  if(need.length) html += '<br>Нет колонок: ' + need.join(', ') + ' — эти пункты будут «❓»';
+  if(collected && collected.txIds.length){
+    html += '<br>Из собранных ' + collected.txIds.length + ' найдено ' + (collected.txIds.length - miss.length) +
+      (miss.length ? ', <b>не хватает ' + miss.length + '</b> — их поищу в Withdrawal requests<div>' + partButtons(miss, 'missing') + '</div>' : ' — все');
+  }
+  html += '<div><button class="pbv-mini" id="pbv-db-reset">✕ Сбросить выгрузки</button></div>';
+  el.className = 'pbv-field ' + (need.length || miss.length ? 'warn' : 'ok');
+  el.innerHTML = html;
+  $('pbv-db-reset').addEventListener('click', function(){ dbIndex = null; renderDbState(); });
+}
+function readDbFile(file){
+  return file.arrayBuffer().then(function(buf){
     var wb = XLSX.read(buf, {type: 'array', raw: true});
     var rows = [];
     wb.SheetNames.forEach(function(n){ rows = rows.concat(XLSX.utils.sheet_to_json(wb.Sheets[n], {raw: true, defval: ''})); });
-    var idx = Checker.buildDbIndex(rows);
-    if(!idx.count){
-      dbIndex = null;
-      el.className = 'pbv-field warn';
-      el.textContent = '⚠ В файле нет колонки «Номер заказа» или она пустая — выгрузка не загружена';
-      return;
-    }
-    idx.fileName = file.name;
-    dbIndex = idx;
-    var need = ['статус', 'сумма', 'валюта', 'дата совершения платежа'].filter(function(c){ return idx.missing.indexOf(c) !== -1; });
-    el.className = 'pbv-field ' + (need.length ? 'warn' : 'ok');
-    el.textContent = (need.length ? '⚠ ' : '✅ ') + file.name + ': ' + idx.count + ' транзакций' +
-      (need.length ? '. Нет колонок: ' + need.join(', ') + ' — эти пункты будут «❓»' : '. Чего нет в файле — ищу в Withdrawal requests');
-  }).catch(function(err){
-    dbIndex = null;
-    el.className = 'pbv-field warn';
-    el.textContent = '⚠ Не удалось прочитать файл: ' + err.message;
-  }).then(function(){ e.target.value = ''; });
+    return Checker.buildDbIndex(rows);
+  });
+}
+$('pbv-db-file').addEventListener('change', function(e){
+  var files = Array.prototype.slice.call(e.target.files || []);
+  if(!files.length) return;
+  var el = $('pbv-db-state');
+  el.className = 'pbv-field'; el.textContent = 'Читаю ' + files.map(function(f){ return f.name; }).join(', ') + '…';
+  var bad = [];
+  files.reduce(function(p, file){
+    return p.then(function(){ return readDbFile(file); }).then(function(idx){
+      if(!idx.count){ bad.push(file.name + ': нет колонки «Номер заказа» или она пустая'); return; }
+      if(!dbIndex) dbIndex = {map: {}, count: 0, files: [], missing: idx.missing};
+      else dbIndex.missing = dbIndex.missing.filter(function(c){ return idx.missing.indexOf(c) !== -1; });
+      Object.keys(idx.map).forEach(function(id){ if(!dbIndex.map[id]) dbIndex.count++; dbIndex.map[id] = idx.map[id]; });
+      dbIndex.files.push({name: file.name, count: idx.count});
+    }, function(err){ bad.push(file.name + ': ' + err.message); });
+  }, Promise.resolve()).then(function(){
+    e.target.value = '';
+    renderDbState();
+    if(bad.length) showToast('⚠ Не загружено — ' + bad.join('; '), 'warn');
+  });
 });
 
+// ════════════════════════════════════════════════════
+// ЗАПУСК
+// ════════════════════════════════════════════════════
+function idsFromBox(){
+  var ids = parseIds($('pbv-ids').value);
+  if(!ids.length) showToast('Вставь хотя бы один Ticket ID', 'warn');
+  return ids;
+}
+function runIds(ids){
+  state.total = ids.length;
+  setProgress();
+  runPool(ids).then(function(){ finish(); }).catch(onError);
+}
+$('pbv-col-apply').addEventListener('click', function(){
+  if(state.running || !_listUrl) return;
+  startCollect('apply');
+  setStatus('Шаг 1: загружаю список по фильтру…');
+  collectPage(0);
+});
+$('pbv-col-ids').addEventListener('click', function(){
+  if(state.running) return;
+  var ids = idsFromBox(); if(!ids.length) return;
+  startCollect('ids');
+  runIds(ids);
+});
+$('pbv-check-collected').addEventListener('click', function(){
+  if(state.running || !collected) return;
+  resetRun('collected', 'check', checkCollectedTask);
+  // тикеты, чья история не загрузилась на шаге 1, пробуем ещё раз
+  runIds(collected.ticketIds.concat((collected.loadErrors || []).map(function(x){ return x.ticketId; })));
+});
 $('pbv-run-apply').addEventListener('click', function(){
   if(state.running || !_listUrl) return;
-  resetRun('apply');
+  resetRun('apply', 'check', checkTask);
   setStatus('Загружаю список по фильтру…');
   collectPage(0);
 });
 $('pbv-run-ids').addEventListener('click', function(){
   if(state.running) return;
-  var ids = parseIds($('pbv-ids').value);
-  if(!ids.length){ showToast('Вставь хотя бы один Ticket ID', 'warn'); return; }
-  resetRun('ids');
-  state.total = ids.length;
-  setProgress();
-  runPool(ids).then(function(){ finish(); }).catch(onError);
+  var ids = idsFromBox(); if(!ids.length) return;
+  resetRun('ids', 'check', checkTask);
+  runIds(ids);
 });
 $('pbv-stop').addEventListener('click', function(){
   if(!state.running) return;
@@ -1021,6 +1223,7 @@ function finish(reason){
   state.finishing = true;
   setRunning(false);
   stopKeepalive();
+  if(state.mode === 'collect'){ finishCollect(reason); return; }
   if(!state.results.length){ setStatus((reason ? reason + ' | ' : '') + 'нет проверенных тикетов'); return; }
   try{
     var fn = buildXLSX();
@@ -1107,9 +1310,9 @@ function buildXLSX(){
     CHECK_KEYS.forEach(function(k){ if(r.checks[k] && r.checks[k].state === 'fail') byCheck[k] = (byCheck[k] || 0) + 1; });
   });
   var sum = [
-    ['Источник', state.source === 'apply' ? 'Фильтр (APPLY)' + (_listPayload && _listPayload.dateFrom ? ', с ' + _listPayload.dateFrom + ' по ' + (_listPayload.dateTo || '') : '') : 'Список Ticket ID'],
+    ['Источник', state.source === 'collected' ? 'Собранный список (шаг 1): ' + (collected ? collected.source : '') : state.source === 'apply' ? 'Фильтр (APPLY)' + (_listPayload && _listPayload.dateFrom ? ', с ' + _listPayload.dateFrom + ' по ' + (_listPayload.dateTo || '') : '') : 'Список Ticket ID'],
     ['Бот', RULES.botLogin],
-    ['Транзакции', dbIndex ? 'выгрузка из базы «' + dbIndex.fileName + '» (' + dbIndex.count + '), остальное — Withdrawal requests' : 'Withdrawal requests'],
+    ['Транзакции', dbIndex ? 'выгрузки из базы: ' + dbIndex.files.map(function(f){ return '«' + f.name + '» (' + f.count + ')'; }).join(', ') + '; чего в них нет — Withdrawal requests' : 'Withdrawal requests'],
     ['Проверено тикетов', state.done],
     ['Тикетов по фильтру (total)', state.expectedTotal || '—'],
     ['Сбор завершён', state.stopReason ? 'РАНЬШЕ ВРЕМЕНИ: ' + state.stopReason : 'полностью'],
@@ -1123,6 +1326,27 @@ function buildXLSX(){
 
   var d = new Date(), p = function(n){ return (n < 10 ? '0' : '') + n; };
   var fn = 'proverka_bota_vyvodi_' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + '-' + p(d.getMinutes()) + '.xlsx';
+  XLSX.writeFile(wb, fn);
+  return fn;
+}
+
+// Шаг 1: номера транзакций одним столбцом, без шапки — сразу вставлять в запрос к базе.
+// Больше TX_FILE_LIMIT — несколько листов «Часть N»
+function buildCollectedXLSX(){
+  var wb = XLSX.utils.book_new();
+  var parts = chunks(collected.txIds, TX_FILE_LIMIT);
+  parts.forEach(function(part, k){
+    var ws = XLSX.utils.aoa_to_sheet(part.map(function(id){ return [Number(id)]; }));
+    part.forEach(function(id, r){ var a = XLSX.utils.encode_cell({r: r, c: 0}); if(ws[a]) ws[a].z = '0'; });
+    ws['!cols'] = [{wch: 14}];
+    XLSX.utils.book_append_sheet(wb, ws, parts.length > 1 ? 'Часть ' + (k + 1) : 'Транзакции');
+  });
+  var map = collected.ticketIds.map(function(t){ return [t, collected.byTicket[t] || '']; });
+  makeSheet(wb, 'Тикеты', ['Ticket ID', 'Transaction ID'], map, [12, 14]);
+  if(collected.loadErrors.length)
+    makeSheet(wb, 'Не загрузилось', ['Ticket ID', 'Причина'], collected.loadErrors.map(function(x){ return [x.ticketId, x.error || '']; }), [12, 80]);
+  var d = new Date(), p = function(n){ return (n < 10 ? '0' : '') + n; };
+  var fn = 'tranzakcii_dlya_bazy_' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + '-' + p(d.getMinutes()) + '.xlsx';
   XLSX.writeFile(wb, fn);
   return fn;
 }
