@@ -1,0 +1,5 @@
+{
+  "_note": "Ответ POST /en/admin/report/requestwithdrawal по транзакции 5550119957 (поиск по id). Пользователь, кошелёк, ФИО и платёжные поля удалены; формат как в API — таблица строкой JSON в поле data.",
+  "data": "{\"Success\":true,\"Value\":{\"Columns\":[\"id\",\"date_edit\",\"id_user\",\"summa\",\"code\",\"status\",\"Stat\",\"currency\",\"commet\",\"subagent\",\"date_payment\",\"summa_fee\",\"admin\",\"hours_passed\",\"date\",\"bank_name\"],\"Data\":[[5550119957,\"\\/Date(1794882294000+0300)\\/\",0,1000.00,\"epay\",3,\"Rejected\",\"DZDM\",\"Отказ оператора. (Технические сложности #03. Пожалуйста, повторите попытку позднее) (Авто удаление отказанных)\",\"Luminous BaridiMob Algeria\",\"\\/Date(1794892320000+0300)\\/\",0.00,\"Baridimob_Luminous_Main\",13,\"\\/Date(1794869110000+0300)\\/\",\"BaridiMob\"]],\"Error\":null,\"Success\":true}}",
+  "params_parse": {"is_man": false, "is_marker": false, "allowDeny": false}
+}
