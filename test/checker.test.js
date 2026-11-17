@@ -258,4 +258,65 @@ test('бот ответил, а отчёт не ответил → ручная 
   assert.strictEqual(r.category, 'manual');
 });
 
+
+// ── Выгрузка транзакций из базы ──────────────────────
+// Заголовки как в выгрузке; даты — числом Excel (как отдаёт SheetJS с raw:true) или строкой
+function serial(wall){ return C.parseWallDate(wall) / 86400000 + 25569; }
+function dbRow(over){
+  return Object.assign({'Номер заказа': 5550861141, 'Статус': 'Одобрено', 'Сумма': 5000, 'Валюта': 'TRY',
+    'Сумма платежа': 5000, 'Валюта платежа': 'TRY', 'Дата создания': serial('2026-11-17 08:03:38'),
+    'Дата совершения платежа': serial('2026-11-17 13:42:31'), 'Комментарий': 'Выплата (код: 2)', 'Агент': 'x'}, over || {});
+}
+function pspTicket(answer, over){
+  var psp = Object.assign({requestTypeId: '8', requestTypeName: 'PSP', currencyKode: 'TRY', amount: '5000', idTransaction: 5550861141}, over || {});
+  return [botRow('2026-11-17 13:43:01', answer, psp), h('2026-11-17 12:00:00', 'Agent_1', Object.assign({nameUserStatus: 'In progress'}, psp)),
+          h('2026-11-17 11:40:21', '', psp)];
+}
+
+test('выгрузка из базы: колонки по названию, даты Excel и строкой', function(){
+  var idx = C.buildDbIndex([dbRow(), dbRow({'Номер заказа': '5539888149', 'Статус': 'Отказ', 'Дата совершения платежа': '17.11.2026 03:12:00'})]);
+  assert.strictEqual(idx.count, 2);
+  assert.deepStrictEqual(idx.missing, []);
+  var t = idx.map['5550861141'];
+  assert.strictEqual(C.fmt(t.finalAt), '2026-11-17 13:42:31');
+  assert.strictEqual(C.fmt(t.createdAt), '2026-11-17 08:03:38');
+  assert.strictEqual(C.txOutcome(t), 'approve');
+  assert.strictEqual(C.txOutcome(idx.map['5539888149']), 'reject');
+  assert.strictEqual(C.fmt(idx.map['5539888149'].finalAt), '2026-11-17 03:12:00');
+});
+
+test('выгрузка из базы: без «Номер заказа» ничего не загружается', function(){
+  var idx = C.buildDbIndex([{'ID': 1, 'Статус': 'Одобрено'}]);
+  assert.strictEqual(idx.count, 0);
+  assert.ok(idx.missing.indexOf('номер заказа') !== -1);
+});
+
+test('выгрузка из базы: статусы кроме Одобрено/Отказ не финальные', function(){
+  ['На рассмотрении', 'Отправлено', 'Получение данных', 'Заблокировано'].forEach(function(st){
+    var t = C.buildDbIndex([dbRow({'Статус': st})]).map['5550861141'];
+    assert.strictEqual(C.txOutcome(t), null, st);
+  });
+});
+
+test('PSP по выгрузке из базы: одобрено, суммы совпадают, ответ 579 → ОК', function(){
+  var tx = C.buildDbIndex([dbRow()]).map['5550861141'];
+  var r = C.analyze(pspTicket('579 ok'), tx);
+  assert.strictEqual(r.category, 'bot_ok', JSON.stringify(r.checks));
+  assert.strictEqual(r.tx.source, 'база');
+});
+
+test('PSP по выгрузке из базы: ответ 28 вместо 579 → ошибка п.11', function(){
+  var tx = C.buildDbIndex([dbRow()]).map['5550861141'];
+  var r = C.analyze(pspTicket('28 ok'), tx);
+  assert.deepStrictEqual(failed(r), ['c11']);
+});
+
+test('валюта тикета совпадает только с валютой платежа (114 USD / 194 AZN) → п.5 с пояснением', function(){
+  var tx = C.buildDbIndex([dbRow({'Сумма': 114, 'Валюта': 'USD', 'Сумма платежа': 194, 'Валюта платежа': 'AZN'})]).map['5550861141'];
+  var r = C.analyze(pspTicket('579 ok', {currencyKode: 'AZN', amount: '114'}), tx);
+  assert.deepStrictEqual(failed(r), ['c5']);
+  assert.ok(/только валюта платежа: 194 AZN/.test(r.checks.c5.detail), r.checks.c5.detail);
+  assert.ok(/сумма платежа 194 AZN/.test(r.checks.c9.detail), r.checks.c9.detail);
+});
+
 console.log('\n' + passed + ' тестов прошло');

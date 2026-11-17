@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Проверка бота автозакрытия выводов
 // @namespace    proverka-bota-vyvodi
-// @version      0.1.1
+// @version      0.2.0
 // @description  Проверяет работу «Бот_ПК закрытия тикетов выводов» по правилам: для каждого тикета грузит историю и транзакцию из отчёта Withdrawal requests, сверяет 11 условий, находит ошибки бота и тикеты, которые бот должен был закрыть, но не закрыл. Ничего не меняет в тикетах — только читает и выгружает Excel.
 // @match        *://th-managment.com/*paymentsupport*
 // @match        *://my-managment.com/*paymentsupport*
@@ -189,13 +189,67 @@ var Checker = (function(){
       createdAt: parseNetDate(o.date),
       editedAt: parseNetDate(o.date_edit),
       finalAt: parseNetDate(o.date_payment),
-      comment: str(o.commet)
+      comment: str(o.commet),
+      source: 'отчёт',
+      _n: true
     };
   }
+
+  // ── Транзакции из выгрузки базы (xlsx/csv) ──────────
+  // Колонки ищутся по названию (без регистра). Обязательна только «Номер заказа» —
+  // это тот же номер, что Transaction ID в тикете
+  var DB_COLS = {
+    id: 'номер заказа', status: 'статус', amount: 'сумма', currency: 'валюта',
+    payAmount: 'сумма платежа', payCurrency: 'валюта платежа',
+    createdAt: 'дата создания', finalAt: 'дата совершения платежа', comment: 'комментарий'
+  };
+  // Дата Excel (число дней с 1899-12-30) → мс «настенного» времени, без часовых поясов
+  function parseAnyDate(v){
+    if(v == null || v === '') return null;
+    if(typeof v === 'number') return v > 20000 && v < 80000 ? Math.round((v - 25569) * 86400) * 1000 : null;
+    if(v instanceof Date) return isNaN(v) ? null : Date.UTC(v.getFullYear(), v.getMonth(), v.getDate(), v.getHours(), v.getMinutes(), v.getSeconds());
+    var s = str(v);
+    var m = /^(\d{2})\.(\d{2})\.(\d{4})[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s);
+    if(m) return Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0));
+    if(/Date\(/.test(s)) return parseNetDate(s);
+    return parseWallDate(s);
+  }
+  // rows — массив объектов {заголовок: значение} (как sheet_to_json).
+  // → {map: {номер: tx}, count, missing: [колонки, которых нет]}
+  function buildDbIndex(rows){
+    var map = {}, count = 0, keys = null, missing = [];
+    (rows || []).forEach(function(o){
+      if(!keys){
+        keys = {};
+        Object.keys(o).forEach(function(h){ keys[low(h)] = h; });
+        Object.keys(DB_COLS).forEach(function(k){ if(!keys[DB_COLS[k]]) missing.push(DB_COLS[k]); });
+      }
+      function get(k){ var h = keys[DB_COLS[k]]; return h == null ? null : o[h]; }
+      var id = str(get('id')).replace(/\.0+$/, '');
+      if(!/^\d+$/.test(id)) return;
+      if(!map[id]) count++;
+      map[id] = {
+        id: id, status: null, statText: str(get('status')),
+        amount: parseAmount(get('amount')), currency: str(get('currency')),
+        payAmount: parseAmount(get('payAmount')), payCurrency: str(get('payCurrency')),
+        createdAt: parseAnyDate(get('createdAt')), editedAt: null,
+        finalAt: parseAnyDate(get('finalAt')), comment: str(get('comment')),
+        source: 'база', _n: true
+      };
+    });
+    return {map: map, count: count, missing: keys ? missing : Object.keys(DB_COLS).map(function(k){ return DB_COLS[k]; })};
+  }
+
   function txOutcome(tx){
     if(!tx) return null;
     if(RULES.txApprovedCodes.indexOf(tx.status) !== -1) return 'approve';
     if(RULES.txRejectedCodes.indexOf(tx.status) !== -1) return 'reject';
+    // Выгрузка из базы: статус только текстом
+    if(tx.status == null){
+      var t = low(tx.statText);
+      if(/^(одобрен|approved)/.test(t)) return 'approve';
+      if(/^(отказ|rejected)/.test(t)) return 'reject';
+    }
     return null;
   }
   function txStatusLabel(tx){
@@ -236,7 +290,9 @@ var Checker = (function(){
     }else{
       c.c5 = !b.currency || !tx.currency ? R('unknown', 'валюта не указана')
         : low(b.currency) === low(tx.currency) ? R('ok', b.currency)
-        : R('fail', 'тикет ' + b.currency + ', транзакция ' + tx.currency);
+        : R('fail', 'тикет ' + b.currency + ', транзакция ' + tx.currency +
+            (tx.payCurrency && low(tx.payCurrency) === low(b.currency)
+              ? ' (с валютой тикета совпадает только валюта платежа: ' + tx.payAmount + ' ' + tx.payCurrency + ')' : ''));
 
       // п.6 и п.8а: тикет создан раньше, чем транзакция стала финальной.
       // date_payment отчёта — с точностью до минуты, поэтому одна и та же минута — «не понять»
@@ -256,10 +312,12 @@ var Checker = (function(){
 
       // п.9: суммы. Для A расхождение допустимо — бот должен поправить сумму (п.10)
       var ta = b.amount, xa = tx.amount;
+      var payNote = tx.payAmount != null && tx.payCurrency && low(tx.payCurrency) !== low(tx.currency)
+        ? '; сумма платежа ' + tx.payAmount + ' ' + tx.payCurrency : '';
       if(xa == null) c.c9 = R('unknown', 'нет суммы транзакции');
-      else if(ta != null && Math.abs(ta - xa) < RULES.amountTolerance) c.c9 = R('ok', 'совпадает: ' + xa);
-      else if(kind === 'A') c.c9 = R('ok', 'отличается (тикет ' + (b.amountRaw || 'пусто') + ', транзакция ' + xa + ') — для ' + b.typeName + ' бот меняет сумму');
-      else if(kind === 'M') c.c9 = R('fail', 'отличается (тикет ' + (b.amountRaw || 'пусто') + ', транзакция ' + xa + ') — для ' + b.typeName + ' закрывать нельзя');
+      else if(ta != null && Math.abs(ta - xa) < RULES.amountTolerance) c.c9 = R('ok', 'совпадает: ' + xa + payNote);
+      else if(kind === 'A') c.c9 = R('ok', 'отличается (тикет ' + (b.amountRaw || 'пусто') + ', транзакция ' + xa + payNote + ') — для ' + b.typeName + ' бот меняет сумму');
+      else if(kind === 'M') c.c9 = R('fail', 'отличается (тикет ' + (b.amountRaw || 'пусто') + ', транзакция ' + xa + payNote + ') — для ' + b.typeName + ' закрывать нельзя');
       else c.c9 = R('unknown', 'отличается, тип тикета не из правил');
     }
 
@@ -322,7 +380,7 @@ var Checker = (function(){
     if(!rows.length){ res.category = 'manual'; res.notes.push('пустая история'); return res; }
 
     var created = rows[0].date;
-    var tx = normalizeTx(txRow);
+    var tx = txRow && txRow._n ? txRow : normalizeTx(txRow);
     var botIdx = findBotResponse(rows);
     var respIdx = -1;
     for(var i = 0; i < rows.length; i++) if(isResponse(rows[i])){ respIdx = i; break; }
@@ -423,7 +481,8 @@ var Checker = (function(){
     parseWallDate: parseWallDate, parseNetDate: parseNetDate, fmt: fmt, parseAmount: parseAmount,
     templateNumber: templateNumber, normalizeHistory: normalizeHistory, parseReport: parseReport,
     normalizeTx: normalizeTx, txOutcome: txOutcome, txStatusLabel: txStatusLabel,
-    transactionNeeded: transactionNeeded, analyze: analyze, nowWall: nowWall
+    transactionNeeded: transactionNeeded, analyze: analyze, nowWall: nowWall,
+    buildDbIndex: buildDbIndex, parseAnyDate: parseAnyDate, DB_COLS: DB_COLS
   };
 })();
 
@@ -438,7 +497,7 @@ window.__pbv_loaded = true;
 // ════════════════════════════════════════════════════
 // КОНФИГ ЗАПРОСОВ
 // ════════════════════════════════════════════════════
-var VERSION = '0.1.1';
+var VERSION = '0.2.0';
 var HISTORY_URL = '/admin/backoffice/paymentsupporthistory';
 var REPORT_URL = '/en/admin/report/requestwithdrawal';
 // Поля формы отчёта Withdrawal requests (как шлёт сама страница); заполнен только id.
@@ -468,6 +527,7 @@ var state = {running: false, source: '', total: 0, done: 0, currentPage: 1, expe
              stopReason: '', pagesDone: 0, finishing: false};
 var _listUrl = null, _listPayload = null, _keepaliveTimer = null;
 var txCache = {};
+var dbIndex = null;   // транзакции из выгрузки базы: {map, count, missing, fileName}
 
 // ════════════════════════════════════════════════════
 // УТИЛИТЫ
@@ -577,6 +637,9 @@ GM_addStyle(`
 #pbv-ids{width:100%;box-sizing:border-box;height:100px;resize:vertical;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e0ecff;font:12px monospace;outline:none;}
 .pbv-btn{width:100%;padding:9px;border-radius:8px;border:1px solid rgba(90,170,255,.6);background:rgba(90,170,255,.16);color:#cfe4ff;font:800 12px Arial,sans-serif;cursor:pointer;}
 .pbv-btn:disabled{opacity:.35;cursor:not-allowed;}
+#pbv-db-state{font-size:11px;}
+#pbv-db-state.ok{border-color:rgba(63,250,130,.4);color:#5fd876;}
+#pbv-db-state.warn{border-color:rgba(240,165,0,.35);color:#f0a500;}
 #pbv-stop{display:none;border-color:rgba(250,80,80,.4);background:rgba(250,80,80,.08);color:#f06060;}
 .pbv-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
 .pbv-metric{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:7px 4px;text-align:center;}
@@ -614,6 +677,9 @@ wrap.innerHTML =
         '<textarea id="pbv-ids" placeholder="26081917&#10;26104522&#10;… (любой разделитель)"></textarea>' +
         '<button class="pbv-btn" id="pbv-run-ids">▶ Проверить список</button>' +
         '<button class="pbv-btn" id="pbv-stop">⏹ Стоп — выгрузить</button>' +
+        '<div class="pbv-sec" style="margin-top:6px">Транзакции из базы (xlsx / csv)</div>' +
+        '<label class="pbv-btn" id="pbv-db-btn" style="text-align:center;box-sizing:border-box">📄 Загрузить выгрузку<input id="pbv-db-file" type="file" accept=".xlsx,.xls,.csv" style="display:none"></label>' +
+        '<div class="pbv-field" id="pbv-db-state">Не загружена — транзакции ищутся в Withdrawal requests</div>' +
         '<label style="font-size:11px;color:rgba(200,220,255,.6);display:flex;align-items:center;gap:8px">Потоков (1–5): <input id="pbv-threads" type="number" min="1" max="5" value="' + DEFAULT_THREADS + '" style="width:48px;padding:4px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#e0ecff"></label>' +
         '<div style="font-size:10px;color:rgba(200,220,255,.45);line-height:1.45">Только чтение: история тикета + транзакция из Withdrawal requests. Бот: <b>' + esc(RULES.botLogin) + '</b>. Удобно сузить фильтр темами «I didn\'t receive my withdrawal» и «Error while withdrawing funds».</div>' +
       '</div>' +
@@ -795,7 +861,12 @@ function fetchTransaction(txId){
 function processTicket(ticketId){
   return fetchHistory(ticketId).then(function(hist){
     var txId = Checker.transactionNeeded(hist);
-    var txP = txId ? fetchTransaction(txId) : Promise.resolve({row: null, error: 'в тикете нет Transaction ID'});
+    var txP = !txId ? Promise.resolve({row: null, error: 'в тикете нет Transaction ID'})
+      : dbIndex && dbIndex.map[txId] ? Promise.resolve({row: dbIndex.map[txId]})
+      : fetchTransaction(txId).then(function(t){
+          if(!t.row && dbIndex) t.error = 'транзакции ' + txId + ' нет ни в выгрузке из базы, ни в Withdrawal requests';
+          return t;
+        });
     return txP.then(function(tx){
       var r = Checker.analyze(hist, tx.row, {txError: tx.error, txLoadFailed: !!tx.failed});
       r.ticketId = ticketId;
@@ -894,6 +965,35 @@ function collectPage(attempt){
   }).catch(onError);
 }
 
+$('pbv-db-file').addEventListener('change', function(e){
+  var file = e.target.files && e.target.files[0];
+  var el = $('pbv-db-state');
+  if(!file) return;
+  el.className = 'pbv-field'; el.textContent = 'Читаю ' + file.name + '…';
+  file.arrayBuffer().then(function(buf){
+    var wb = XLSX.read(buf, {type: 'array', raw: true});
+    var rows = [];
+    wb.SheetNames.forEach(function(n){ rows = rows.concat(XLSX.utils.sheet_to_json(wb.Sheets[n], {raw: true, defval: ''})); });
+    var idx = Checker.buildDbIndex(rows);
+    if(!idx.count){
+      dbIndex = null;
+      el.className = 'pbv-field warn';
+      el.textContent = '⚠ В файле нет колонки «Номер заказа» или она пустая — выгрузка не загружена';
+      return;
+    }
+    idx.fileName = file.name;
+    dbIndex = idx;
+    var need = ['статус', 'сумма', 'валюта', 'дата совершения платежа'].filter(function(c){ return idx.missing.indexOf(c) !== -1; });
+    el.className = 'pbv-field ' + (need.length ? 'warn' : 'ok');
+    el.textContent = (need.length ? '⚠ ' : '✅ ') + file.name + ': ' + idx.count + ' транзакций' +
+      (need.length ? '. Нет колонок: ' + need.join(', ') + ' — эти пункты будут «❓»' : '. Чего нет в файле — ищу в Withdrawal requests');
+  }).catch(function(err){
+    dbIndex = null;
+    el.className = 'pbv-field warn';
+    el.textContent = '⚠ Не удалось прочитать файл: ' + err.message;
+  }).then(function(){ e.target.value = ''; });
+});
+
 $('pbv-run-apply').addEventListener('click', function(){
   if(state.running || !_listUrl) return;
   resetRun('apply');
@@ -967,10 +1067,10 @@ function makeSheet(wb, name, hdr, rows, widths, cellBg){
 var CHECK_KEYS = Object.keys(COND_TITLES);
 var MAIN_HDR = ['Ticket ID', 'Тип', 'Тема', 'Создан', 'Кто ответил', 'Когда ответил', 'Шаблон', 'Нужен шаблон',
   'Transaction ID', 'Статус транзакции', 'Транзакция проведена', 'Сумма тикета', 'Сумма транзакции',
-  'Валюта тикета', 'Валюта транзакции', 'Customer status до ответа'].concat(CHECK_KEYS.map(function(k){ return COND_TITLES[k]; }))
+  'Валюта тикета', 'Валюта транзакции', 'Customer status до ответа', 'Источник транзакции', 'Текст ответа'].concat(CHECK_KEYS.map(function(k){ return COND_TITLES[k]; }))
   .concat(['Что не так / пояснение']);
-var MAIN_W = [11, 8, 22, 17, 24, 17, 8, 8, 13, 14, 17, 10, 10, 9, 9, 16].concat(CHECK_KEYS.map(function(){ return 9; })).concat([70]);
-var FIRST_CHECK_COL = 16;
+var MAIN_W = [11, 8, 22, 17, 24, 17, 8, 8, 13, 14, 17, 10, 10, 9, 9, 16, 10, 40].concat(CHECK_KEYS.map(function(){ return 9; })).concat([70]);
+var FIRST_CHECK_COL = 18;
 
 function mainRow(r){
   var b = r.before || {}, tx = r.tx || {};
@@ -978,7 +1078,8 @@ function mainRow(r){
     r.ticketId, b.typeName || '', b.topicName || '', Checker.fmt(r.created), r.who || '', Checker.fmt(r.at),
     r.actual == null ? '' : r.actual, r.expected == null ? '' : r.expected,
     r.txId || '', Checker.txStatusLabel(r.tx), Checker.fmt(tx.finalAt), b.amountRaw || '',
-    tx.amount == null ? '' : tx.amount, b.currency || '', tx.currency || '', b.userStatus || ''
+    tx.amount == null ? '' : tx.amount, b.currency || '', tx.currency || '', b.userStatus || '',
+    tx.source || '', r.response ? r.response.answer : ''
   ].concat(CHECK_KEYS.map(function(k){
     var c = r.checks && r.checks[k];
     return c ? MARK[c.state] + (c.state === 'ok' || c.state === 'na' ? '' : ' ' + c.detail) : '';
@@ -1008,6 +1109,7 @@ function buildXLSX(){
   var sum = [
     ['Источник', state.source === 'apply' ? 'Фильтр (APPLY)' + (_listPayload && _listPayload.dateFrom ? ', с ' + _listPayload.dateFrom + ' по ' + (_listPayload.dateTo || '') : '') : 'Список Ticket ID'],
     ['Бот', RULES.botLogin],
+    ['Транзакции', dbIndex ? 'выгрузка из базы «' + dbIndex.fileName + '» (' + dbIndex.count + '), остальное — Withdrawal requests' : 'Withdrawal requests'],
     ['Проверено тикетов', state.done],
     ['Тикетов по фильтру (total)', state.expectedTotal || '—'],
     ['Сбор завершён', state.stopReason ? 'РАНЬШЕ ВРЕМЕНИ: ' + state.stopReason : 'полностью'],
