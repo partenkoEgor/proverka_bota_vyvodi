@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Проверка бота автозакрытия выводов
 // @namespace    proverka-bota-vyvodi
-// @version      0.3.0
+// @version      0.3.1
 // @description  Проверяет работу «Бот_ПК закрытия тикетов выводов» по правилам: для каждого тикета грузит историю и транзакцию из отчёта Withdrawal requests, сверяет 11 условий, находит ошибки бота и тикеты, которые бот должен был закрыть, но не закрыл. Ничего не меняет в тикетах — только читает и выгружает Excel.
 // @match        *://th-managment.com/*paymentsupport*
 // @match        *://my-managment.com/*paymentsupport*
@@ -51,9 +51,10 @@ var RULES = {
   txApprovedCodes: [2],   // Одобрено
   txRejectedCodes: [3],   // Отказ (в отчёте Stat = "Rejected")
 
-  // п.11 — номер шаблона в начале Response to customer
+  // п.11 — номер шаблона в начале Response to customer. Можно списком —
+  // тогда правильным считается любой из номеров
   templates: {
-    A: { approve: 579, approveChanged: 5, reject: 4 },
+    A: { approve: [579, 28], approveChanged: 5, reject: 4 },
     M: { approve: 411, reject: 412 }
   },
 
@@ -331,8 +332,12 @@ var Checker = (function(){
       expected = outcome === 'reject' ? t.reject
         : kind === 'A' && !amountsEqual ? t.approveChanged : t.approve;
     }
+    if(expected != null) expected = [].concat(expected);  // всегда список допустимых номеров
     return {checks: c, kind: kind, outcome: outcome, amountsEqual: amountsEqual, expected: expected};
   }
+
+  // [579, 28] → "579 или 28"
+  function tplText(list){ return list == null ? '' : [].concat(list).join(' или '); }
 
   function worst(checks, keys){
     var s = 'ok';
@@ -414,8 +419,8 @@ var Checker = (function(){
         c.c11 = R('fail', 'внутренний статус «' + bot.internal + '» вместо Response to customer');
       else if(ev.expected == null)
         c.c11 = R('unknown', 'не понять, какой шаблон нужен (тип или статус транзакции вне правил)');
-      else if(actual === ev.expected) c.c11 = R('ok', String(actual));
-      else c.c11 = R('fail', 'ответ ' + (actual == null ? 'без номера' : actual) + ', нужен ' + ev.expected);
+      else if(ev.expected.indexOf(actual) !== -1) c.c11 = R('ok', String(actual));
+      else c.c11 = R('fail', 'ответ ' + (actual == null ? 'без номера' : actual) + ', нужен ' + tplText(ev.expected));
 
       res.who = bot.admin; res.at = bot.date; res.before = before; res.response = bot;
       res.checks = c; res.kind = ev.kind; res.outcome = ev.outcome;
@@ -482,7 +487,7 @@ var Checker = (function(){
     templateNumber: templateNumber, normalizeHistory: normalizeHistory, parseReport: parseReport,
     normalizeTx: normalizeTx, txOutcome: txOutcome, txStatusLabel: txStatusLabel,
     transactionNeeded: transactionNeeded, analyze: analyze, nowWall: nowWall,
-    buildDbIndex: buildDbIndex, parseAnyDate: parseAnyDate, DB_COLS: DB_COLS
+    buildDbIndex: buildDbIndex, parseAnyDate: parseAnyDate, DB_COLS: DB_COLS, tplText: tplText
   };
 })();
 
@@ -497,7 +502,7 @@ window.__pbv_loaded = true;
 // ════════════════════════════════════════════════════
 // КОНФИГ ЗАПРОСОВ
 // ════════════════════════════════════════════════════
-var VERSION = '0.3.0';
+var VERSION = '0.3.1';
 var HISTORY_URL = '/admin/backoffice/paymentsupporthistory';
 var REPORT_URL = '/en/admin/report/requestwithdrawal';
 // Поля формы отчёта Withdrawal requests (как шлёт сама страница); заполнен только id.
@@ -777,7 +782,7 @@ function addFoundItem(r){
   div.className = 'pbv-item';
   div.style.borderLeftColor = CATS[r.category].color;
   div.innerHTML = '<b>#' + esc(r.ticketId) + '</b> — ' + esc(CATS[r.category].title) +
-    (r.expected != null || r.actual != null ? ' · шаблон ' + esc(r.actual == null ? '—' : r.actual) + ' / нужен ' + esc(r.expected == null ? '?' : r.expected) : '') +
+    (r.expected != null || r.actual != null ? ' · шаблон ' + esc(r.actual == null ? '—' : r.actual) + ' / нужен ' + esc(r.expected == null ? '?' : Checker.tplText(r.expected)) : '') +
     '<div class="sub">' + esc(problemsText(r) || r.error || '') + '</div>';
   var box = $('pbv-found');
   box.insertBefore(div, box.firstChild);
@@ -1279,7 +1284,7 @@ function mainRow(r){
   var b = r.before || {}, tx = r.tx || {};
   return [
     r.ticketId, b.typeName || '', b.topicName || '', Checker.fmt(r.created), r.who || '', Checker.fmt(r.at),
-    r.actual == null ? '' : r.actual, r.expected == null ? '' : r.expected,
+    r.actual == null ? '' : r.actual, Checker.tplText(r.expected),
     r.txId || '', Checker.txStatusLabel(r.tx), Checker.fmt(tx.finalAt), b.amountRaw || '',
     tx.amount == null ? '' : tx.amount, b.currency || '', tx.currency || '', b.userStatus || '',
     tx.source || '', r.response ? r.response.answer : ''

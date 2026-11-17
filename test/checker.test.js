@@ -69,7 +69,7 @@ test('суммы: "1000", "1 000,50", 1000.00', function(){
 test('реальный тикет 26081917: бот ответил верно (BT M, отказ → 412)', function(){
   var r = C.analyze(HIST, C.parseReport(REPORT)[0]);
   assert.strictEqual(r.category, 'bot_ok', JSON.stringify(r.checks, null, 1));
-  assert.strictEqual(r.expected, 412);
+  assert.deepStrictEqual(r.expected, [412]);
   assert.strictEqual(r.actual, 412);
   assert.strictEqual(r.before.userStatus, 'In progress');
   assert.strictEqual(r.before.typeName, 'BT M');  // тип на момент ответа, а не при создании (API)
@@ -179,12 +179,12 @@ function apiTicket(answer, botAmount, beforeAmount){
 test('API, одобрено, суммы совпадают → 579', function(){
   var r = C.analyze(apiTicket('579 ok', '1000', '1000'), txRow({status: 2, Stat: 'Approved'}));
   assert.strictEqual(r.category, 'bot_ok', JSON.stringify(r.checks));
-  assert.strictEqual(r.expected, 579);
+  assert.deepStrictEqual(r.expected, [579, 28]);
 });
 test('API, одобрено, сумма отличалась, бот поправил → 5', function(){
   var r = C.analyze(apiTicket('5 ok', '1000', '800'), txRow({status: 2, Stat: 'Approved'}));
   assert.strictEqual(r.category, 'bot_ok', JSON.stringify(r.checks));
-  assert.strictEqual(r.expected, 5);
+  assert.deepStrictEqual(r.expected, [5]);
   assert.strictEqual(r.checks.c10.state, 'ok');
 });
 test('API, одобрено, сумма отличалась, а бот ответил 579 → ошибка п.11', function(){
@@ -198,12 +198,12 @@ test('API, сумма отличалась, бот не поправил сум�
 test('API, отказ → 4', function(){
   var r = C.analyze(apiTicket('4 declined', '1000', '1000'), txRow());
   assert.strictEqual(r.category, 'bot_ok');
-  assert.strictEqual(r.expected, 4);
+  assert.deepStrictEqual(r.expected, [4]);
 });
 test('BT M, одобрено → 411', function(){
   var r = C.analyze(ticket({response: botRow('2026-11-17 08:13:08', '411 ok')}), txRow({status: 2, Stat: 'Approved'}));
   assert.strictEqual(r.category, 'bot_ok');
-  assert.strictEqual(r.expected, 411);
+  assert.deepStrictEqual(r.expected, [411]);
 });
 
 // ── Пропуски ─────────────────────────────────────────
@@ -212,7 +212,7 @@ test('пропуск: условия выполнены, а ответил че�
   var r = C.analyze(ticket({response: resp}), txRow());
   assert.strictEqual(r.category, 'missed', JSON.stringify(r.checks));
   assert.strictEqual(r.who, 'pay_mena_201');
-  assert.strictEqual(r.expected, 412);
+  assert.deepStrictEqual(r.expected, [412]);
   assert.strictEqual(Math.round(r.waitedMin), 48);
 });
 
@@ -305,10 +305,27 @@ test('PSP по выгрузке из базы: одобрено, суммы со
   assert.strictEqual(r.tx.source, 'база');
 });
 
-test('PSP по выгрузке из базы: ответ 28 вместо 579 → ошибка п.11', function(){
+test('PSP по выгрузке из базы: одобрено, ответ 28 — тоже правильный (как 579)', function(){
   var tx = C.buildDbIndex([dbRow()]).map['5550861141'];
   var r = C.analyze(pspTicket('28 ok'), tx);
+  assert.strictEqual(r.category, 'bot_ok', JSON.stringify(r.checks));
+  assert.strictEqual(r.checks.c11.detail, '28');
+});
+
+test('ответ 28 на отказ или при изменённой сумме — ошибка п.11', function(){
+  var rej = C.buildDbIndex([dbRow({'Статус': 'Отказ', 'Дата совершения платежа': '17.11.2026 13:42:00'})]).map['5550861141'];
+  var r = C.analyze(pspTicket('28 ok'), rej);
   assert.deepStrictEqual(failed(r), ['c11']);
+  assert.ok(/нужен 4$/.test(r.checks.c11.detail), r.checks.c11.detail);
+  var r2 = C.analyze(apiTicket('28 ok', '1000', '800'), txRow({status: 2, Stat: 'Approved'}));
+  assert.deepStrictEqual(failed(r2), ['c11']);
+  assert.ok(/нужен 5$/.test(r2.checks.c11.detail), r2.checks.c11.detail);
+});
+
+test('ответ мимо обоих (например 411 на API) — ошибка «нужен 579 или 28»', function(){
+  var r = C.analyze(apiTicket('411 ok', '1000', '1000'), txRow({status: 2, Stat: 'Approved'}));
+  assert.deepStrictEqual(failed(r), ['c11']);
+  assert.ok(/нужен 579 или 28$/.test(r.checks.c11.detail), r.checks.c11.detail);
 });
 
 test('валюта тикета совпадает только с валютой платежа (114 USD / 194 AZN) → п.5 с пояснением', function(){
